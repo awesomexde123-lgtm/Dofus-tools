@@ -1,0 +1,193 @@
+from scapy.all import sniff, TCP, IP, Raw
+import win32gui, win32con, win32process, win32api
+import psutil, logging, traceback, re, threading, ctypes, time
+
+# ─── Configuración ──────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    handlers=[logging.FileHandler("dofus_monitor.log", encoding="utf-8")]
+)
+log = logging.getLogger(__name__)
+
+SERVERS = {
+    "Allisteria": "34.253.140.241",
+    "Fallaster":  "34.255.49.243",
+    "Fallaster2": "54.228.180.96"
+}
+REMOTE_IPS  = set(SERVERS.values())
+REMOTE_PORT = 443
+
+_ip_filter = " or ".join(f"host {ip}" for ip in REMOTE_IPS)
+BPF_FILTER  = f"tcp and port {REMOTE_PORT} and ({_ip_filter})"
+WINDOW_KEYWORD = "Dofus Retro"
+
+# ─── Variables globales ─────────────────────────
+all_detected = {}
+id_to_port   = {}
+id_to_name   = {}
+ultimo_emisor_port = None 
+ultimo_lider_grupo_port = None # <--- Nueva variable para retorno de grupo
+
+stop_monitor   = threading.Event()
+monitor_thread = None
+
+# ─── Funciones de ventana ──────────────────────
+def get_pid_by_port(local_port: int) -> int | None:
+    try:
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.laddr.port == local_port and conn.pid:
+                return conn.pid
+    except: return None
+    return None
+
+def get_hwnd_by_pid_tree(pid: int) -> int | None:
+    try:
+        proc = psutil.Process(pid)
+        parent = proc.parent() or proc
+        result = None
+        def enum_handler(hwnd, _):
+            nonlocal result
+            if result or not win32gui.IsWindowVisible(hwnd): return
+            _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
+            if found_pid == parent.pid and WINDOW_KEYWORD in win32gui.GetWindowText(hwnd):
+                result = hwnd
+        win32gui.EnumWindows(enum_handler, None)
+        return result
+    except: return None
+
+def _set_foreground(hwnd: int) -> bool:
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+        target_thread, _ = win32process.GetWindowThreadProcessId(hwnd)
+        attached = False
+        if current_thread != target_thread:
+            try:
+                win32process.AttachThreadInput(current_thread, target_thread, True)
+                attached = True
+            except: pass
+        try:
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetForegroundWindow(hwnd)
+        except:
+            win32api.keybd_event(0, 0, 0, 0)
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                try: win32process.AttachThreadInput(current_thread, target_thread, False)
+                except: pass
+        return True
+    except: return False
+
+def activar_ventana_por_puerto(local_port: int) -> bool:
+    pid = get_pid_by_port(local_port)
+    if not pid: return False
+    hwnd = get_hwnd_by_pid_tree(pid)
+    if not hwnd: return False
+    return _set_foreground(hwnd)
+
+# ─── Lógica de Red ─────────────────────────────
+def get_server_name(ip: str) -> str:
+    for name, sip in SERVERS.items():
+        if sip == ip: return name
+    return ip
+
+def _registrar_personaje(char_id_str: str, local_port: int, nombre: str, server: str) -> None:
+    if char_id_str not in all_detected or all_detected[char_id_str]["port"] != local_port:
+        all_detected[char_id_str] = {"name": nombre, "port": local_port, "server": server}
+        id_to_port[char_id_str] = local_port
+        id_to_name[char_id_str] = nombre
+        print(f"  ✔ [{server}] {nombre} detectado (Puerto: {local_port})")
+
+def process_message(packet) -> None:
+    global ultimo_emisor_port, ultimo_lider_grupo_port
+    if stop_monitor.is_set() or not (packet.haslayer(IP) and packet.haslayer(Raw)): return
+
+    data = packet[Raw].load
+    ip_layer = packet[IP]
+    tcp_layer = packet[TCP]
+    
+    src_ip = ip_layer.src
+    local_port = tcp_layer.dport if src_ip in REMOTE_IPS else tcp_layer.sport
+    server = get_server_name(src_ip if src_ip in REMOTE_IPS else ip_layer.dst)
+
+    # 1. Registro (ASK) - Captura ID y Nombre
+    ask_matches = re.findall(rb"ASK\|(\d+)\|([^|]+)\|", data)
+    for cid, name in ask_matches:
+        _registrar_personaje(cid.decode(), local_port, name.decode(errors="ignore"), server)
+
+    # 2. Turnos (GTS)
+    gts_matches = re.findall(rb"GTS(\d+)\|", data)
+    for char_id in gts_matches:
+        cid_str = char_id.decode()
+        if cid_str in id_to_port and local_port == id_to_port[cid_str]:
+            print(f"\n  ★ Turno: {id_to_name.get(cid_str, cid_str)}")
+            activar_ventana_por_puerto(local_port)
+
+    # 3. Intercambios (ERK / EV)
+    erk_matches = re.findall(rb"ERK(\d+)\|(\d+)\|", data)
+    for emisor_id, receptor_id in erk_matches:
+        emi_str, rec_str = emisor_id.decode(), receptor_id.decode()
+        if rec_str in id_to_port:
+            if emi_str in id_to_port: ultimo_emisor_port = id_to_port[emi_str]
+            print(f"\n  🤝 Solicitud intercambio para: {id_to_name.get(rec_str, rec_str)}")
+            activar_ventana_por_puerto(id_to_port[rec_str])
+
+    if re.search(rb"EV[a-zA-Z]?(\x00|$)", data) or b"EVa" in data:
+        if ultimo_emisor_port:
+            print(f"  ✔ Cierre intercambio. Volviendo...")
+            time.sleep(0.4) 
+            activar_ventana_por_puerto(ultimo_emisor_port)
+            ultimo_emisor_port = None 
+
+    # 4. GRUPO (PIK / PCK)
+    # Formato PIK|NombreEmisor|NombreReceptor
+    pik_matches = re.findall(rb"PIK([^|]+)\|([^|\x00]+)", data)
+    for emi_name_raw, rec_name_raw in pik_matches:
+        emi_n = emi_name_raw.decode(errors="ignore")
+        rec_n = rec_name_raw.decode(errors="ignore")
+        
+        # Buscar puertos por nombre (búsqueda inversa en id_to_name)
+        rec_id = next((k for k, v in id_to_name.items() if v == rec_n), None)
+        emi_id = next((k for k, v in id_to_name.items() if v == emi_n), None)
+
+        if rec_id and rec_id in id_to_port:
+            if emi_id and emi_id in id_to_port:
+                ultimo_lider_grupo_port = id_to_port[emi_id]
+            
+            print(f"\n  👥 Invitación de grupo para: {rec_n}")
+            activar_ventana_por_puerto(id_to_port[rec_id])
+
+    # PCK indica que el grupo se formó o actualizó (tras aceptar PIK)
+    if b"PCK" in data:
+        if ultimo_lider_grupo_port:
+            print(f"  ✔ Grupo confirmado. Volviendo al líder...")
+            time.sleep(0.3)
+            activar_ventana_por_puerto(ultimo_lider_grupo_port)
+            ultimo_lider_grupo_port = None
+
+# ─── Ejecución ─────────────────────────────────
+def start_monitor():
+    try:
+        sniff(filter=BPF_FILTER, prn=process_message, store=False, 
+              stop_filter=lambda _: stop_monitor.is_set())
+    except: log.error(traceback.format_exc())
+
+def menu_principal():
+    print("\n" + "═"*50)
+    print("      DOFUS RETRO - MONITOR V3.1 (GRUPO + TRAD)")
+    print("═"*50)
+    t = threading.Thread(target=start_monitor, daemon=True)
+    t.start()
+    print("  ✔ Monitor activo. Conecta tus pjs.")
+    print("  Si ya estas conectado al servidor reconecta para utilizar el monitor.")
+    print("  → Escribe 'stop' para salir.\n")
+    while True:
+        if input("").lower() == "stop": break
+    stop_monitor.set()
+
+if __name__ == "__main__":
+    menu_principal()
