@@ -1,0 +1,549 @@
+from scapy.all import sniff, TCP, IP, Raw
+import psutil, logging, traceback, re, threading, ctypes, time
+import tkinter as tk
+from tkinter import font as tkfont
+
+# ── win32 opcional (Windows) ──────────────────────────────────────────────────
+try:
+    import win32gui, win32con, win32process, win32api
+    WIN32_AVAILABLE = True
+except ImportError:
+    WIN32_AVAILABLE = False
+
+# ─── Logging solo a archivo ───────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    handlers=[logging.FileHandler("dofus_monitor.log", encoding="utf-8")]
+)
+log = logging.getLogger(__name__)
+
+# ─── Red ──────────────────────────────────────────────────────────────────────
+SERVERS = {
+    "Allisteria": "34.253.140.241",
+    "Fallaster":  "34.255.49.243",
+    "Fallaster2": "54.228.180.96"
+}
+REMOTE_IPS  = set(SERVERS.values())
+REMOTE_PORT = 443
+_ip_filter  = " or ".join(f"host {ip}" for ip in REMOTE_IPS)
+BPF_FILTER  = f"tcp and port {REMOTE_PORT} and ({_ip_filter})"
+WINDOW_KEYWORD = "Dofus Retro"
+
+# ─── Estado global ────────────────────────────────────────────────────────────
+all_detected            = {}
+id_to_port              = {}
+id_to_name              = {}
+ultimo_emisor_port      = None
+ultimo_lider_grupo_port = None
+stop_monitor            = threading.Event()
+
+# ─── Flags de features ───────────────────────────────────────────────────────
+feature_autofocus = True
+feature_autogroup = True
+feature_autotrade = True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Toggle switch estilo iOS
+# ══════════════════════════════════════════════════════════════════════════════
+class ToggleSwitch(tk.Canvas):
+    W, H  = 44, 24
+    ON_C  = "#00e676"
+    OFF_C = "#2e4a5a"
+
+    def __init__(self, parent, initial=True, command=None, bg="#1b2d3e", **kw):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=bg, highlightthickness=0, cursor="hand2", **kw)
+        self._on      = initial
+        self._command = command
+        self._knob_x  = self.W - self.H + 4 if initial else 4
+        self._draw()
+        self.bind("<Button-1>", self._click)
+
+    def _draw(self):
+        self.delete("all")
+        color = self.ON_C if self._on else self.OFF_C
+        r = self.H // 2
+        self.create_oval(0, 0, self.H, self.H, fill=color, outline="")
+        self.create_rectangle(r, 0, self.W - r, self.H, fill=color, outline="")
+        self.create_oval(self.W - self.H, 0, self.W, self.H, fill=color, outline="")
+        pad = 3
+        x = self._knob_x
+        self.create_oval(x, pad, x + self.H - pad * 2, self.H - pad,
+                         fill="#ffffff", outline="")
+
+    def _animate(self, target, steps=6):
+        delta = (target - self._knob_x) / steps
+        def step(i=0):
+            if i >= steps:
+                self._knob_x = target
+                self._draw()
+                return
+            self._knob_x += delta
+            self._draw()
+            self.after(16, lambda: step(i + 1))
+        step()
+
+    def _click(self, _=None):
+        self._on = not self._on
+        target = self.W - self.H + 4 if self._on else 4
+        self._animate(target)
+        if self._command:
+            self._command(self._on)
+
+    def get(self):
+        return self._on
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Aplicación principal
+# ══════════════════════════════════════════════════════════════════════════════
+class DofusToolsApp(tk.Tk):
+    BG        = "#0f1923"
+    PANEL     = "#162230"
+    CARD      = "#1b2d3e"
+    BORDER    = "#223344"
+    GREEN     = "#00e676"
+    GREEN_DIM = "#1a4a2e"
+    RED       = "#ff5252"
+    RED_DIM   = "#4a1a1a"
+    TEAL      = "#00bcd4"
+    TEXT      = "#d0dde8"
+    TEXT_DIM  = "#6a8a9a"
+    ACCENT    = "#f5a623"
+
+    WIN_W = 460
+    WIN_H = 640
+
+    def __init__(self):
+        super().__init__()
+        self.title("Dofus Tools")
+        self.geometry(f"{self.WIN_W}x{self.WIN_H}")
+        self.resizable(False, False)
+        self.configure(bg=self.BG)
+        self._setup_fonts()
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _setup_fonts(self):
+        self.font_title   = tkfont.Font(family="Segoe UI", size=14, weight="bold")
+        self.font_section = tkfont.Font(family="Segoe UI", size=7,  weight="bold")
+        self.font_label   = tkfont.Font(family="Segoe UI", size=9,  weight="bold")
+        self.font_sub     = tkfont.Font(family="Segoe UI", size=8)
+        self.font_badge   = tkfont.Font(family="Segoe UI", size=7,  weight="bold")
+        self.font_char    = tkfont.Font(family="Segoe UI", size=9)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _section_label(self, parent, text):
+        f = tk.Frame(parent, bg=self.BG)
+        f.pack(fill="x", padx=18, pady=(14, 4))
+        tk.Label(f, text=text, bg=self.BG, fg=self.TEXT_DIM,
+                 font=self.font_section).pack(side="left")
+        tk.Frame(f, bg=self.BORDER, height=1).pack(
+            side="left", fill="x", expand=True, padx=(8, 0))
+
+    def _make_feature_card(self, parent, icon, title, subtitle,
+                           initial_on, on_toggle):
+        card = tk.Frame(parent, bg=self.CARD, highlightthickness=1,
+                        highlightbackground=self.BORDER)
+        card.pack(fill="x", padx=18, pady=4)
+        inner = tk.Frame(card, bg=self.CARD)
+        inner.pack(fill="x", padx=14, pady=10)
+
+        tk.Label(inner, text=icon, bg=self.CARD, fg=self.TEAL,
+                 font=tkfont.Font(size=15)).pack(side="left", padx=(0, 12))
+
+        txt = tk.Frame(inner, bg=self.CARD)
+        txt.pack(side="left", fill="x", expand=True)
+        row = tk.Frame(txt, bg=self.CARD)
+        row.pack(fill="x")
+        tk.Label(row, text=title, bg=self.CARD, fg=self.TEXT,
+                 font=self.font_label).pack(side="left")
+
+        badge = tk.Label(
+            row,
+            text="ENCENDIDO" if initial_on else "APAGADO",
+            bg=self.GREEN_DIM if initial_on else self.RED_DIM,
+            fg=self.GREEN     if initial_on else self.RED,
+            font=self.font_badge, padx=6, pady=1
+        )
+        badge.pack(side="left", padx=8)
+        tk.Label(txt, text=subtitle, bg=self.CARD, fg=self.TEXT_DIM,
+                 font=self.font_sub).pack(anchor="w")
+
+        def _wrapped(state, b=badge, cb=on_toggle):
+            b.configure(
+                text="ENCENDIDO" if state else "APAGADO",
+                bg=self.GREEN_DIM if state else self.RED_DIM,
+                fg=self.GREEN     if state else self.RED
+            )
+            cb(state)
+
+        toggle = ToggleSwitch(inner, initial=initial_on,
+                              command=_wrapped, bg=self.CARD)
+        toggle.pack(side="right")
+        return card, badge, toggle
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        # Header
+        header = tk.Frame(self, bg=self.PANEL, height=64)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        ih = tk.Frame(header, bg=self.PANEL)
+        ih.pack(fill="both", expand=True, padx=20)
+
+        lc = tk.Canvas(ih, width=32, height=32, bg=self.PANEL,
+                       highlightthickness=0)
+        lc.pack(side="left", pady=16)
+        lc.create_oval(2, 2, 30, 30, fill=self.ACCENT, outline="")
+        lc.create_oval(9, 9, 23, 23, fill=self.PANEL, outline="")
+
+        tk.Label(ih, text="Dofus Tools", bg=self.PANEL, fg=self.TEXT,
+                 font=self.font_title).pack(side="left", padx=10)
+
+        of = tk.Frame(ih, bg=self.PANEL)
+        of.pack(side="right")
+        tk.Label(of, text="ONLINE", bg=self.PANEL, fg=self.GREEN,
+                 font=self.font_badge).pack(side="left")
+        oc = tk.Canvas(of, width=12, height=12, bg=self.PANEL,
+                       highlightthickness=0)
+        oc.pack(side="left", padx=(4, 0))
+        oc.create_oval(1, 1, 11, 11, fill=self.GREEN, outline="")
+
+        tk.Frame(self, bg=self.BORDER, height=1).pack(fill="x")
+
+        # Scroll
+        canvas = tk.Canvas(self, bg=self.BG, highlightthickness=0,
+                           bd=0, yscrollincrement=1)
+        sb = tk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self.scroll_frame = tk.Frame(canvas, bg=self.BG)
+        win_id = canvas.create_window((0, 0), window=self.scroll_frame,
+                                      anchor="nw", width=self.WIN_W)
+        self.scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+        for w in (self.scroll_frame, canvas):
+            w.bind("<MouseWheel>",
+                   lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+        self._build_content(self.scroll_frame)
+
+    def _build_content(self, parent):
+        global feature_autofocus, feature_autogroup, feature_autotrade
+
+        # ESTADO GENERAL
+        self._section_label(parent, "ESTADO GENERAL")
+        estado_card = tk.Frame(parent, bg=self.CARD, highlightthickness=1,
+                               highlightbackground=self.BORDER)
+        estado_card.pack(fill="x", padx=18, pady=(0, 4))
+
+        self._estado_labels = {}
+        for key, label in [("autofocus", "Auto-focus"),
+                            ("autogroup", "Auto-group"),
+                            ("autotrade", "Auto-trade")]:
+            row = tk.Frame(estado_card, bg=self.CARD)
+            row.pack(fill="x", padx=14, pady=5)
+            tk.Label(row, text=label, bg=self.CARD, fg=self.TEXT,
+                     font=self.font_label).pack(side="left")
+            lbl = tk.Label(row, text="ACTIVO",
+                           bg=self.GREEN_DIM, fg=self.GREEN,
+                           font=self.font_badge, padx=7, pady=2)
+            lbl.pack(side="right")
+            self._estado_labels[key] = lbl
+
+        # COMBAT
+        self._section_label(parent, "COMBAT")
+
+        def _on_autofocus(state):
+            global feature_autofocus
+            feature_autofocus = state
+            self._update_estado("autofocus", state)
+
+        def _on_autogroup(state):
+            global feature_autogroup
+            feature_autogroup = state
+            self._update_estado("autogroup", state)
+
+        self._make_feature_card(
+            parent, "⚔", "Auto-focus",
+            "Cambia de pantalla automáticamente en tu turno",
+            initial_on=True, on_toggle=_on_autofocus)
+
+        self._make_feature_card(
+            parent, "👥", "Auto-group",
+            "Responde a invitaciones de grupo automáticamente",
+            initial_on=True, on_toggle=_on_autogroup)
+
+        # INTERCAMBIO
+        self._section_label(parent, "INTERCAMBIO")
+
+        def _on_autotrade(state):
+            global feature_autotrade
+            feature_autotrade = state
+            self._update_estado("autotrade", state)
+
+        self._make_feature_card(
+            parent, "🤝", "Auto-trade",
+            "Cambia de pantalla al recibir una solicitud de intercambio",
+            initial_on=True, on_toggle=_on_autotrade)
+
+        # SESIONES ACTIVAS
+        self._section_label(parent, "SESIONES ACTIVAS")
+        sess_card = tk.Frame(parent, bg=self.CARD, highlightthickness=1,
+                             highlightbackground=self.BORDER)
+        sess_card.pack(fill="x", padx=18, pady=(4, 18))
+
+        hdr = tk.Frame(sess_card, bg=self.BORDER)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="PERSONAJE", bg=self.BORDER, fg=self.TEXT_DIM,
+                 font=self.font_section, pady=6).pack(side="left", padx=12)
+        tk.Label(hdr, text="SERVIDOR", bg=self.BORDER, fg=self.TEXT_DIM,
+                 font=self.font_section, pady=6).pack(side="right", padx=12)
+
+        self.chars_frame  = tk.Frame(sess_card, bg=self.CARD)
+        self.chars_frame.pack(fill="x", padx=4, pady=4)
+        self.char_widgets = {}
+
+        # DISCLAIMER
+        disc = tk.Frame(parent, bg="#1a2a1a", highlightthickness=1,
+                        highlightbackground="#2a4a2a")
+        disc.pack(fill="x", padx=18, pady=(4, 18))
+        disc_inner = tk.Frame(disc, bg="#1a2a1a")
+        disc_inner.pack(fill="x", padx=12, pady=10)
+
+        tk.Label(disc_inner, text="⚠", bg="#1a2a1a", fg=self.ACCENT,
+                 font=tkfont.Font(size=13)).pack(side="left", padx=(0, 10))
+
+        tk.Label(
+            disc_inner,
+            text="Si ya estás conectado al servidor,\ndeberás reconectar tu personaje para que el monitor funcione.",
+            bg="#1a2a1a", fg="#8aaa8a",
+            font=tkfont.Font(family="Segoe UI", size=8),
+            justify="left"
+        ).pack(side="left")
+
+    # ── Estado general ────────────────────────────────────────────────────────
+    def _update_estado(self, key: str, active: bool):
+        lbl = self._estado_labels.get(key)
+        if lbl:
+            lbl.configure(
+                text="ACTIVO"     if active else "INACTIVO",
+                bg=self.GREEN_DIM if active else self.RED_DIM,
+                fg=self.GREEN     if active else self.RED
+            )
+
+    # ── Tabla de personajes ───────────────────────────────────────────────────
+    def update_characters(self):
+        current = {v["name"]: v for v in all_detected.values()}
+        for name in list(self.char_widgets.keys()):
+            if name not in current:
+                self.char_widgets[name].destroy()
+                del self.char_widgets[name]
+        for name, info in current.items():
+            if name not in self.char_widgets:
+                row = tk.Frame(self.chars_frame, bg=self.CARD)
+                row.pack(fill="x", padx=8, pady=3)
+                dot = tk.Canvas(row, width=10, height=10, bg=self.CARD,
+                                highlightthickness=0)
+                dot.pack(side="left", padx=(0, 8))
+                dot.create_oval(1, 1, 9, 9, fill=self.GREEN, outline="")
+                tk.Label(row, text=name, bg=self.CARD, fg=self.TEXT,
+                         font=self.font_char, anchor="w").pack(
+                             side="left", fill="x", expand=True)
+                tk.Label(row, text=info.get("server", ""), bg=self.CARD,
+                         fg=self.TEXT_DIM,
+                         font=self.font_sub).pack(side="right")
+                self.char_widgets[name] = row
+
+    def _on_close(self):
+        stop_monitor.set()
+        self.destroy()
+
+
+# ─── Instancia global ─────────────────────────────────────────────────────────
+app: DofusToolsApp = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Win32 helpers
+# ══════════════════════════════════════════════════════════════════════════════
+def get_pid_by_port(local_port: int):
+    try:
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.laddr.port == local_port and conn.pid:
+                return conn.pid
+    except:
+        return None
+
+
+def get_hwnd_by_pid_tree(pid: int):
+    if not WIN32_AVAILABLE:
+        return None
+    try:
+        proc   = psutil.Process(pid)
+        parent = proc.parent() or proc
+        result = None
+        def enum_handler(hwnd, _):
+            nonlocal result
+            if result or not win32gui.IsWindowVisible(hwnd): return
+            _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
+            if found_pid == parent.pid and WINDOW_KEYWORD in win32gui.GetWindowText(hwnd):
+                result = hwnd
+        win32gui.EnumWindows(enum_handler, None)
+        return result
+    except:
+        return None
+
+
+def _set_foreground(hwnd: int) -> bool:
+    if not WIN32_AVAILABLE:
+        return False
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        cur_t = ctypes.windll.kernel32.GetCurrentThreadId()
+        tgt_t, _ = win32process.GetWindowThreadProcessId(hwnd)
+        attached = False
+        if cur_t != tgt_t:
+            try:
+                win32process.AttachThreadInput(cur_t, tgt_t, True)
+                attached = True
+            except: pass
+        try:
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetForegroundWindow(hwnd)
+        except:
+            win32api.keybd_event(0, 0, 0, 0)
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                try: win32process.AttachThreadInput(cur_t, tgt_t, False)
+                except: pass
+        return True
+    except:
+        return False
+
+
+def activar_ventana_por_puerto(local_port: int) -> bool:
+    pid = get_pid_by_port(local_port)
+    if not pid: return False
+    hwnd = get_hwnd_by_pid_tree(pid)
+    if not hwnd: return False
+    return _set_foreground(hwnd)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Lógica de red
+# ══════════════════════════════════════════════════════════════════════════════
+def get_server_name(ip: str) -> str:
+    for name, sip in SERVERS.items():
+        if sip == ip: return name
+    return ip
+
+
+def _registrar_personaje(char_id_str, local_port, nombre, server):
+    if char_id_str not in all_detected or all_detected[char_id_str]["port"] != local_port:
+        all_detected[char_id_str] = {"name": nombre, "port": local_port, "server": server}
+        id_to_port[char_id_str]   = local_port
+        id_to_name[char_id_str]   = nombre
+        log.info(f"[{server}] {nombre} registrado")
+        if app:
+            app.after(0, app.update_characters)
+
+
+def process_message(packet) -> None:
+    global ultimo_emisor_port, ultimo_lider_grupo_port
+    if stop_monitor.is_set(): return
+    if not (packet.haslayer(IP) and packet.haslayer(Raw)): return
+
+    data       = packet[Raw].load
+    ip_layer   = packet[IP]
+    tcp_layer  = packet[TCP]
+    src_ip     = ip_layer.src
+    local_port = tcp_layer.dport if src_ip in REMOTE_IPS else tcp_layer.sport
+    server     = get_server_name(src_ip if src_ip in REMOTE_IPS else ip_layer.dst)
+
+    # 1. Registro
+    for cid, name in re.findall(rb"ASK\|(\d+)\|([^|]+)\|", data):
+        _registrar_personaje(cid.decode(), local_port,
+                             name.decode(errors="ignore"), server)
+
+    # 2. Turnos — Auto-focus
+    if feature_autofocus:
+        for char_id in re.findall(rb"GTS(\d+)\|", data):
+            cid_str = char_id.decode()
+            if cid_str in id_to_port and local_port == id_to_port[cid_str]:
+                log.info(f"Turno: {id_to_name.get(cid_str, cid_str)}")
+                activar_ventana_por_puerto(local_port)
+
+    # 3. Intercambios — Auto-trade
+    if feature_autotrade:
+        for emisor_id, receptor_id in re.findall(rb"ERK(\d+)\|(\d+)\|", data):
+            emi_str, rec_str = emisor_id.decode(), receptor_id.decode()
+            if rec_str in id_to_port:
+                if emi_str in id_to_port:
+                    ultimo_emisor_port = id_to_port[emi_str]
+                log.info(f"Intercambio: {id_to_name.get(emi_str)} → {id_to_name.get(rec_str)}")
+                activar_ventana_por_puerto(id_to_port[rec_str])
+
+        if re.search(rb"EV[a-zA-Z]?(\x00|$)", data) or b"EVa" in data:
+            if ultimo_emisor_port:
+                log.info("Intercambio cerrado")
+                time.sleep(0.4)
+                activar_ventana_por_puerto(ultimo_emisor_port)
+                ultimo_emisor_port = None
+
+    # 4. Grupo — Auto-group
+    if feature_autogroup:
+        for emi_raw, rec_raw in re.findall(rb"PIK([^|]+)\|([^|\x00]+)", data):
+            emi_n = emi_raw.decode(errors="ignore")
+            rec_n = rec_raw.decode(errors="ignore")
+            rec_id = next((k for k, v in id_to_name.items() if v == rec_n), None)
+            emi_id = next((k for k, v in id_to_name.items() if v == emi_n), None)
+            if rec_id and rec_id in id_to_port:
+                if emi_id and emi_id in id_to_port:
+                    ultimo_lider_grupo_port = id_to_port[emi_id]
+                log.info(f"Invitación de grupo para {rec_n}")
+                activar_ventana_por_puerto(id_to_port[rec_id])
+
+        if b"PCK" in data and ultimo_lider_grupo_port:
+            log.info("Grupo formado")
+            time.sleep(0.3)
+            activar_ventana_por_puerto(ultimo_lider_grupo_port)
+            ultimo_lider_grupo_port = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Monitor hilo
+# ══════════════════════════════════════════════════════════════════════════════
+def start_monitor():
+    try:
+        log.info("Monitor iniciado")
+        sniff(filter=BPF_FILTER, prn=process_message, store=False,
+              stop_filter=lambda _: stop_monitor.is_set())
+    except Exception:
+        log.error(traceback.format_exc())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    global app
+    app = DofusToolsApp()
+    threading.Thread(target=start_monitor, daemon=True).start()
+    app.mainloop()
+    stop_monitor.set()
+
+
+if __name__ == "__main__":
+    main()
