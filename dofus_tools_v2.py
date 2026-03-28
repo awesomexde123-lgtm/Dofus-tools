@@ -5,6 +5,7 @@ from tkinter import font as tkfont, messagebox, simpledialog
 import json
 import os
 from pathlib import Path
+import socket  # <-- AÑADE ESTA LÍNEA
 
 # ── win32 opcional (Windows) ──────────────────────────────────────────────────
 try:
@@ -30,9 +31,11 @@ SERVERS = {
 }
 REMOTE_IPS  = set(SERVERS.values())
 REMOTE_PORT = 443
-_ip_filter  = " or ".join(f"host {ip}" for ip in REMOTE_IPS)
-BPF_FILTER  = f"tcp and port {REMOTE_PORT} and ({_ip_filter})"
+BPF_FILTER  = f"tcp and port {REMOTE_PORT}" # Modificado para capturar el primer paquete
 WINDOW_KEYWORD = "Dofus Retro"
+
+# ─── Regex para detectar hosts dofus ───────────────────────────────────────────
+HOST_REGEX = re.compile(rb"dofusretro-[\w\-]+\.ankama-games\.com")
 
 # ─── Estado global ────────────────────────────────────────────────────────────
 all_detected            = {}
@@ -1361,12 +1364,35 @@ def _registrar_personaje(char_id_str, local_port, nombre, server):
 def process_message(packet) -> None:
     global ultimo_emisor_nombre, ultimo_lider_grupo_port
     if stop_monitor.is_set(): return
-    if not (packet.haslayer(IP) and packet.haslayer(Raw)): return
+    if not (packet.haslayer(IP) and packet.haslayer(TCP) and packet.haslayer(Raw)): return
 
-    data       = packet[Raw].load
+    data = packet[Raw].load
+
+    # --- 0. DETECCIÓN DINÁMICA DE NUEVOS SERVIDORES ---
+    match = HOST_REGEX.search(data)
+    if match:
+        host = match.group().decode()
+        try:
+            ip = socket.gethostbyname(host)
+            if ip not in REMOTE_IPS:
+                REMOTE_IPS.add(ip)
+                # Extraer nombre amigable (ej. "fallaster2") y añadirlo a SERVERS
+                nombre_server = host.split('-')[1].split('.')[0].capitalize() if '-' in host else host
+                SERVERS[nombre_server] = ip
+                log.info(f"🆕 Nuevo servidor detectado: {host} -> {ip}")
+                print(f"🆕 Nuevo servidor detectado: {host} -> {ip}")
+        except Exception as e:
+            log.error(f"Error resolviendo {host}: {e}")
+    # ---------------------------------------------------
+
     ip_layer   = packet[IP]
     tcp_layer  = packet[TCP]
     src_ip     = ip_layer.src
+
+    # EARLY RETURN: Si el tráfico no es de/hacia Dofus, lo descartamos inmediatamente
+    if src_ip not in REMOTE_IPS and ip_layer.dst not in REMOTE_IPS:
+        return
+
     local_port = tcp_layer.dport if src_ip in REMOTE_IPS else tcp_layer.sport
     server     = get_server_name(src_ip if src_ip in REMOTE_IPS else ip_layer.dst)
 
@@ -1443,6 +1469,38 @@ def start_monitor():
     except Exception:
         log.error(traceback.format_exc())
 
+def monitor_desconexiones():
+    """Hilo liviano que detecta personajes desconectados cada 5 segundos."""
+    while not stop_monitor.is_set():
+        try:
+            # Puertos TCP activos en este momento
+            puertos_activos = set()
+            for conn in psutil.net_connections(kind="tcp"):
+                if conn.status in ("ESTABLISHED", "SYN_SENT") and conn.laddr:
+                    puertos_activos.add(conn.laddr.port)
+
+            eliminados = []
+            for char_id, info in list(all_detected.items()):
+                if info["port"] not in puertos_activos:
+                    eliminados.append((char_id, info["name"]))
+
+            for char_id, nombre in eliminados:
+                log.info(f"[DESCONEXIÓN] {nombre} ya no tiene puerto activo → eliminado")
+                print(f"[DEBUG] Personaje desconectado: {nombre}")
+                all_detected.pop(char_id, None)
+                id_to_port.pop(char_id, None)
+                id_to_name.pop(char_id, None)
+                if nombre in orden_personajes:
+                    orden_personajes.remove(nombre)
+
+            if eliminados and app:
+                app.after(0, app.update_characters)
+
+        except Exception as e:
+            log.error(f"[monitor_desconexiones] {e}")
+
+        stop_monitor.wait(5)  # espera 5 s o hasta que se detenga
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Entry point
@@ -1450,7 +1508,8 @@ def start_monitor():
 def main():
     global app
     app = DofusToolsApp()
-    threading.Thread(target=start_monitor, daemon=True).start()
+    threading.Thread(target=start_monitor,        daemon=True).start()
+    threading.Thread(target=monitor_desconexiones, daemon=True).start()
     app.mainloop()
     stop_monitor.set()
 
