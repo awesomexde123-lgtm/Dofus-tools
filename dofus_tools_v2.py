@@ -279,11 +279,54 @@ class LayoutManager:
         "window_positions.json",
         "window_positions",
     ]
+    _PREFS_FILE = "dofus_tools_prefs.json"
 
     def __init__(self):
         self.config_path = self._resolve_config_path()
+        self.prefs_path  = self._resolve_prefs_path()
         print(f"[LAYOUT] Archivo compartido con Wintabber: {self.config_path}")
+        print(f"[LAYOUT] Preferencias: {self.prefs_path}")
         log.info(f"[LAYOUT] config_path={self.config_path}")
+
+    def _resolve_prefs_path(self) -> str:
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+        base_dir = os.path.join(appdata, self._DIR)
+        return os.path.join(base_dir, self._PREFS_FILE)
+
+    def _load_prefs(self) -> dict:
+        try:
+            if os.path.exists(self.prefs_path):
+                with open(self.prefs_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            log.error(f"[LAYOUT] Error al leer preferencias: {e}")
+        return {}
+
+    def _save_prefs(self, prefs: dict) -> bool:
+        try:
+            os.makedirs(os.path.dirname(self.prefs_path), exist_ok=True)
+            with open(self.prefs_path, 'w', encoding='utf-8') as f:
+                json.dump(prefs, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            log.error(f"[LAYOUT] Error al guardar preferencias: {e}")
+            return False
+
+    def get_default_layout(self):
+        """Devuelve el nombre del layout preferido, o None si no hay ninguno."""
+        prefs = self._load_prefs()
+        return prefs.get("default_layout", None)
+
+    def set_default_layout(self, layout_name):
+        """Establece (o borra con None) el layout preferido."""
+        prefs = self._load_prefs()
+        if layout_name is None:
+            prefs.pop("default_layout", None)
+            print("[LAYOUT] Layout preferido eliminado")
+        else:
+            prefs["default_layout"] = layout_name
+            print(f"[LAYOUT] Layout preferido establecido: '{layout_name}'")
+        return self._save_prefs(prefs)
 
     def _resolve_config_path(self) -> str:
         appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
@@ -346,6 +389,20 @@ class LayoutManager:
             log.error(f"[LAYOUT] Error al cargar layout '{layout_name}': {e}")
             return None
 
+    @staticmethod
+    def _extraer_nombre_de_window(window_name: str) -> str:
+        """
+        Extrae el nombre del personaje del título completo de la ventana.
+        Ejemplo: "Awesomesac - Dofus Retro v1.47.22" → "Awesomesac"
+        También maneja casos donde el WindowName ya es solo el nombre del personaje.
+        """
+        # Intentar separar por " - " y tomar la primera parte
+        if " - " in window_name:
+            return window_name.split(" - ")[0].strip()
+        # Si no tiene separador, devolver tal cual (compatibilidad con layouts guardados
+        # desde Dofus Tools que ya guardan el nombre corto)
+        return window_name.strip()
+
     def apply_layout_to_slots(self, layout_name):
         global orden_personajes
         layout = self.load_layout(layout_name)
@@ -353,51 +410,103 @@ class LayoutManager:
             return False
 
         print(f"[LAYOUT] Aplicando layout '{layout_name}'")
+        # Mapa nombre_personaje → info, usando los nombres detectados
         vivos = {v["name"]: v for v in all_detected.values()}
+        # También construir un mapa en minúsculas para búsqueda case-insensitive
+        vivos_lower = {n.lower(): n for n in vivos.keys()}
+
+        # Ordenar las ventanas del layout por su posición (0, 1, 2, ...)
         sorted_windows = sorted(layout.items(), key=lambda x: x[1])
-        nuevo_orden = []
+
+        # nuevo_orden tendrá capacidad para el slot más alto del layout
+        max_pos = max(layout.values()) if layout else 0
+        nuevo_orden = [None] * (max_pos + 1)
+
         personajes_no_encontrados = []
 
-        for window_name, _ in sorted_windows:
+        for window_name, position in sorted_windows:
+            # Extraer el nombre limpio del personaje desde el título de la ventana
+            nombre_limpio = self._extraer_nombre_de_window(window_name)
+
+            # Buscar match: primero exacto, luego case-insensitive, luego parcial
             personaje_encontrado = None
-            for personaje_detectado in vivos.keys():
-                if (window_name.lower() in personaje_detectado.lower() or
-                        personaje_detectado.lower() in window_name.lower()):
-                    personaje_encontrado = personaje_detectado
-                    break
-            if personaje_encontrado and personaje_encontrado not in nuevo_orden:
-                nuevo_orden.append(personaje_encontrado)
+
+            # 1) Match exacto
+            if nombre_limpio in vivos:
+                personaje_encontrado = nombre_limpio
+
+            # 2) Match case-insensitive
+            if personaje_encontrado is None:
+                personaje_encontrado = vivos_lower.get(nombre_limpio.lower())
+
+            # 3) Match parcial (el nombre limpio contiene al detectado o viceversa)
+            if personaje_encontrado is None:
+                for det_lower, det_real in vivos_lower.items():
+                    if nombre_limpio.lower() in det_lower or det_lower in nombre_limpio.lower():
+                        personaje_encontrado = det_real
+                        break
+
+            if personaje_encontrado is not None:
+                # Si ya está asignado a otro slot, ignorar duplicado
+                if personaje_encontrado not in nuevo_orden:
+                    nuevo_orden[position] = personaje_encontrado
+                    print(f"[LAYOUT]   Slot {position + 1}: '{personaje_encontrado}' ← '{window_name}'")
             else:
-                personajes_no_encontrados.append(window_name)
+                personajes_no_encontrados.append(f"'{window_name}' (nombre: '{nombre_limpio}')")
+                print(f"[LAYOUT]   Slot {position + 1}: SIN MATCH para '{window_name}' (nombre buscado: '{nombre_limpio}')")
 
+        # Eliminar los None del arreglo (slots sin match) y compactar
+        nuevo_orden_limpio = [p for p in nuevo_orden if p is not None]
+
+        # Agregar al final cualquier personaje detectado que no esté en el layout
         for personaje in vivos.keys():
-            if personaje not in nuevo_orden:
-                nuevo_orden.append(personaje)
+            if personaje not in nuevo_orden_limpio:
+                nuevo_orden_limpio.append(personaje)
+                print(f"[LAYOUT]   (extra, no en layout): '{personaje}'")
 
-        if nuevo_orden:
-            orden_personajes[:] = nuevo_orden
-            print(f"[LAYOUT] Nuevo orden de personajes:")
-            for i, personaje in enumerate(nuevo_orden):
-                print(f"[LAYOUT]   Slot {i+1}: {personaje}")
+        if nuevo_orden_limpio:
+            orden_personajes[:] = nuevo_orden_limpio
+            print(f"[LAYOUT] Orden final aplicado:")
+            for i, personaje in enumerate(nuevo_orden_limpio):
+                print(f"[LAYOUT]   Ctrl+Alt+{i + 1} → '{personaje}'")
             if personajes_no_encontrados:
-                print(f"[LAYOUT] Personajes del layout no encontrados: {personajes_no_encontrados}")
+                print(f"[LAYOUT] ADVERTENCIA - Sin match en sesiones activas: {personajes_no_encontrados}")
             if app:
                 app.after(0, app.update_characters)
             print(f"[LAYOUT] Layout '{layout_name}' aplicado exitosamente")
-            log.info(f"[LAYOUT] Layout '{layout_name}' aplicado con {len(nuevo_orden)} personajes")
+            log.info(f"[LAYOUT] Layout '{layout_name}' aplicado con {len(nuevo_orden_limpio)} personajes")
             return True
         else:
-            print(f"[LAYOUT] No se pudieron encontrar personajes para el layout")
+            print(f"[LAYOUT] No se pudieron encontrar personajes para el layout '{layout_name}'")
+            print(f"[LAYOUT] Personajes activos: {list(vivos.keys())}")
+            print(f"[LAYOUT] Nombres en layout: {[self._extraer_nombre_de_window(w) for w in layout.keys()]}")
             return False
 
     def save_current_layout(self, layout_name, description=""):
         global orden_personajes
         try:
             layouts = self.get_available_layouts()
-            positions = [
-                {"WindowName": personaje, "Position": i}
-                for i, personaje in enumerate(orden_personajes)
-            ]
+
+            positions = []
+            for i, personaje in enumerate(orden_personajes):
+                # Intentar obtener el título real de la ventana desde win32 si disponible
+                window_title = personaje  # fallback: solo el nombre del personaje
+                if WIN32_AVAILABLE:
+                    try:
+                        for char_id, info in all_detected.items():
+                            if info["name"] == personaje:
+                                pid = get_pid_by_port(info["port"])
+                                if pid:
+                                    hwnd = get_hwnd_by_pid_tree(pid)
+                                    if hwnd:
+                                        titulo = win32gui.GetWindowText(hwnd)
+                                        if titulo:
+                                            window_title = titulo
+                                break
+                    except Exception:
+                        pass
+                positions.append({"WindowName": window_title, "Position": i})
+
             layouts[layout_name] = {
                 "Name":        layout_name,
                 "Positions":   positions,
@@ -407,6 +516,8 @@ class LayoutManager:
             ok = self._save_all_layouts(layouts)
             if ok:
                 print(f"[LAYOUT] '{layout_name}' guardado ({len(positions)} personajes)")
+                for p in positions:
+                    print(f"[LAYOUT]   Pos {p['Position']}: {p['WindowName']}")
             return ok
         except Exception as e:
             print(f"[LAYOUT] Error al guardar layout: {e}")
@@ -447,11 +558,18 @@ class LayoutManager:
             for layout_name, layout_data in layouts_raw.items():
                 positions    = layout_data.get("Positions", [])
                 window_names = [p.get("WindowName", "") for p in positions]
-                unique_names = set(window_names)
-                es_generico  = (
-                    len(unique_names) <= 1 or
-                    all("Dofus Retro" in n for n in window_names)
-                )
+
+                # Un layout es "genérico" (sin nombres reales de personajes) solo si
+                # TODOS los WindowName son idénticos o vacíos — no por contener "Dofus Retro".
+                # Los layouts de Wintabber tienen el formato "NombrePersonaje - Dofus Retro vX.Y.Z"
+                # que SÍ contiene nombres reales, por lo que NO son genéricos.
+                nombres_limpios = [
+                    (n.split(" - ")[0].strip() if " - " in n else n.strip())
+                    for n in window_names
+                ]
+                unique_limpios = set(nombres_limpios) - {""}
+                es_generico = len(unique_limpios) == 0  # solo si no hay nombres reconocibles
+
                 resultados[layout_name] = (layout_data, es_generico)
 
             print(f"[LAYOUT] Importados {len(resultados)} layouts desde: {filepath}")
@@ -731,6 +849,11 @@ class LayoutManagerGUI(tk.Toplevel):
                                    font=tkfont.Font(family="Segoe UI", size=7))
         self.lbl_date.pack(anchor="w", pady=(2, 0))
 
+        self.lbl_default_badge = tk.Label(inner, text="", bg=self.CARD,
+                                           fg=self.ACCENT,
+                                           font=tkfont.Font(family="Segoe UI", size=7, weight="bold"))
+        self.lbl_default_badge.pack(anchor="w", pady=(4, 0))
+
         tk.Frame(right, bg=self.BORDER, height=1).pack(fill="x", pady=10)
 
         btn_cfg = dict(relief="flat", cursor="hand2",
@@ -742,6 +865,12 @@ class LayoutManagerGUI(tk.Toplevel):
                                    command=self._apply_layout,
                                    state="disabled", **btn_cfg)
         self.btn_apply.pack(fill="x", pady=(0, 6))
+
+        self.btn_set_default = tk.Button(right, text="⭐  MARCAR PREFERIDO",
+                                          bg="#2a2a0a", fg=self.ACCENT,
+                                          command=self._set_as_default,
+                                          state="disabled", **btn_cfg)
+        self.btn_set_default.pack(fill="x", pady=(0, 6))
 
         self.btn_delete = tk.Button(right, text="🗑  ELIMINAR",
                                     bg=self.RED_DIM, fg=self.RED,
@@ -779,15 +908,18 @@ class LayoutManagerGUI(tk.Toplevel):
 
     def _refresh_layouts(self):
         self._layouts = self.lm.get_available_layouts()
+        self._default_name = self.lm.get_default_layout()
         self.listbox.delete(0, "end")
         for name in self._layouts:
-            self.listbox.insert("end", f"  {name}")
+            prefix = "⭐ " if name == self._default_name else "    "
+            self.listbox.insert("end", f"{prefix}{name}")
         count = len(self._layouts)
         self._set_status(f"{count} layout{'s' if count != 1 else ''} encontrado{'s' if count != 1 else ''}.")
         self._selected_name = None
         self._clear_details()
         self.btn_apply.config(state="disabled")
         self.btn_delete.config(state="disabled")
+        self.btn_set_default.config(state="disabled")
 
     def _on_select(self, event=None):
         sel = self.listbox.curselection()
@@ -806,6 +938,15 @@ class LayoutManagerGUI(tk.Toplevel):
         self.lbl_slots.config(text=f"🔢 {len(positions)} personajes")
         self.lbl_date.config(text=f"📅 {date}")
 
+        is_default = (name == self._default_name)
+        self.lbl_default_badge.config(text="⭐ Layout preferido" if is_default else "")
+        self.btn_set_default.config(
+            text="✖  QUITAR PREFERIDO" if is_default else "⭐  MARCAR PREFERIDO",
+            bg=self.RED_DIM if is_default else "#2a2a0a",
+            fg=self.RED if is_default else self.ACCENT,
+            state="normal"
+        )
+
         self.btn_apply.config(state="normal")
         self.btn_delete.config(state="normal")
         self._set_status(f"Seleccionado: {name}")
@@ -815,6 +956,7 @@ class LayoutManagerGUI(tk.Toplevel):
         self.lbl_desc.config(text="")
         self.lbl_slots.config(text="")
         self.lbl_date.config(text="")
+        self.lbl_default_badge.config(text="")
 
     def _apply_layout(self):
         if not self._selected_name:
@@ -831,6 +973,26 @@ class LayoutManagerGUI(tk.Toplevel):
                                    "No se encontraron personajes que coincidan con el layout.\n"
                                    "Asegúrate de tener personajes conectados.",
                                    parent=self)
+
+    def _set_as_default(self):
+        if not self._selected_name:
+            return
+        is_default = (self._selected_name == self._default_name)
+        if is_default:
+            # Quitar preferido
+            self.lm.set_default_layout(None)
+            self._default_name = None
+            self._set_status("✖ Layout preferido eliminado.")
+        else:
+            # Establecer como preferido
+            self.lm.set_default_layout(self._selected_name)
+            self._default_name = self._selected_name
+            self._set_status(f"⭐ '{self._selected_name}' establecido como preferido.")
+        # Refrescar listbox para mostrar/quitar la estrella
+        self._refresh_layouts()
+        # Notificar a la ventana principal para que actualice el botón
+        if app:
+            app.after(0, app.refresh_default_layout_btn)
 
     def _delete_layout(self):
         if not self._selected_name:
@@ -1289,15 +1451,33 @@ class DofusToolsApp(tk.Tk):
         tk.Label(text_frame, text="Carga layouts guardados en Wintabber Dofus",
                  bg=self.CARD, fg=self.TEXT_DIM, font=self.font_sub).pack(anchor="w")
 
+        btn_col = tk.Frame(layout_inner, bg=self.CARD)
+        btn_col.pack(side="right", padx=(10, 0))
+
         cargar_btn = tk.Button(
-            layout_inner, text="GESTOR DE LAYOUTS",
+            btn_col, text="GESTOR DE LAYOUTS",
             command=abrir_gestor_layouts,
             bg=self.TEAL, fg="white", font=self.font_label,
             padx=15, pady=5, relief="flat", cursor="hand2"
         )
-        cargar_btn.pack(side="right", padx=(10, 0))
+        cargar_btn.pack(fill="x")
         cargar_btn.bind("<Enter>", lambda e: cargar_btn.config(bg="#0097a7"))
         cargar_btn.bind("<Leave>", lambda e: cargar_btn.config(bg=self.TEAL))
+
+        # ── Botón "Cargar preferido" ──────────────────────────────────────────
+        default_name = layout_manager.get_default_layout()
+        btn_label    = f"⭐ {default_name}" if default_name else "⭐ Sin preferido"
+        self._btn_load_default = tk.Button(
+            btn_col,
+            text=btn_label,
+            command=self._load_default_layout,
+            bg="#2a2a0a" if default_name else self.PANEL,
+            fg=self.ACCENT if default_name else self.TEXT_DIM,
+            font=self.font_sub,
+            padx=6, pady=4, relief="flat", cursor="hand2" if default_name else "arrow",
+            state="normal" if default_name else "disabled"
+        )
+        self._btn_load_default.pack(fill="x", pady=(6, 0))
 
         self._section_label(parent, "SESIONES ACTIVAS  ·  ARRASTRA PARA REORDENAR SLOTS")
         sess_card = tk.Frame(parent, bg=self.CARD, highlightthickness=1,
@@ -1329,6 +1509,62 @@ class DofusToolsApp(tk.Tk):
             font=tkfont.Font(family="Segoe UI", size=8),
             justify="left"
         ).pack(side="left")
+
+    def _load_default_layout(self):
+        """Carga el layout marcado como preferido."""
+        default_name = layout_manager.get_default_layout()
+        if not default_name:
+            messagebox.showwarning(
+                "Sin preferido",
+                "No hay un layout preferido configurado.\n"
+                "Abre el Gestor de Layouts y marca uno con ⭐.",
+                parent=self
+            )
+            return
+        # Verificar que el layout aún existe
+        layouts = layout_manager.get_available_layouts()
+        if default_name not in layouts:
+            messagebox.showerror(
+                "Layout no encontrado",
+                f"El layout preferido '{default_name}' ya no existe.\n"
+                "Configura un nuevo preferido en el Gestor de Layouts.",
+                parent=self
+            )
+            layout_manager.set_default_layout(None)
+            self.refresh_default_layout_btn()
+            return
+        ok = layout_manager.apply_layout_to_slots(default_name)
+        if ok:
+            messagebox.showinfo(
+                "Layout cargado",
+                f"Layout preferido '{default_name}' aplicado correctamente.",
+                parent=self
+            )
+        else:
+            messagebox.showwarning(
+                "Sin coincidencias",
+                f"No se encontraron personajes que coincidan con '{default_name}'.\n"
+                "Asegúrate de tener personajes conectados.",
+                parent=self
+            )
+
+    def refresh_default_layout_btn(self):
+        """Actualiza el texto y estado del botón de layout preferido."""
+        if not hasattr(self, "_btn_load_default"):
+            return
+        default_name = layout_manager.get_default_layout()
+        if default_name:
+            self._btn_load_default.config(
+                text=f"⭐ {default_name}",
+                bg="#2a2a0a", fg=self.ACCENT,
+                cursor="hand2", state="normal"
+            )
+        else:
+            self._btn_load_default.config(
+                text="⭐ Sin preferido",
+                bg=self.PANEL, fg=self.TEXT_DIM,
+                cursor="arrow", state="disabled"
+            )
 
     def _update_estado(self, key: str, active: bool):
         lbl = self._estado_labels.get(key)
