@@ -1,64 +1,61 @@
-# Autofocus – Dofus Retro
+# Dofus Tools
 
-Autofocus es una herramienta que detecta automáticamente cuándo es tu turno en Dofus Retro y cambia el foco a la ventana correcta del personaje.
+Herramienta de automatización y gestión de ventanas para **Dofus Retro** multijugador en un mismo equipo.
 
-Está pensada especialmente para jugadores en multicuenta, donde cambiar manualmente entre ventanas puede ser lento o incómodo.
+---
 
-## Aviso importante
+## ¿Qué hace?
 
-Este proyecto fue creado con fines educativos.
+Detecta eventos del juego y automatiza tres acciones:
 
-No modifica el juego ni interactúa directamente con él. Solo analiza tráfico de red local para detectar eventos.
+| Feature | Descripción |
+|---|---|
+| **Auto-focus** | Al llegar tu turno en combate, enfoca automáticamente la ventana correcta con `Ctrl+Alt+1..0` |
+| **Auto-group** | Al recibir una invitación de grupo, cambia el foco al personaje invitado |
+| **Auto-trade** | Al recibir una solicitud de intercambio, cambia a la ventana del personaje receptor |
 
-Aun así, el uso de herramientas externas puede ir en contra de los términos de servicio de Ankama.  
-Úsalo bajo tu propia responsabilidad.
+Cada feature puede activarse/desactivarse desde la interfaz con un toggle.
 
-## Uso rápido (versión ejecutable)
-
-Si solo quieres usar la herramienta sin instalar nada complicado:
-
-1. Ve a la sección de Releases  
-2. Descarga DofusTools.zip  
-3. Extrae los archivos  
-4. Instala Npcap (ver abajo)  
-5. Ejecuta DofusTools.exe como administrador  
+---
 
 ## Requisitos
 
-Para que el programa funcione correctamente necesitas instalar:
+- Python 3.8+
+- Windows
 
-Npcap  
+```
+pip install scapy psutil pywin32
+```
 
-Durante la instalación asegúrate de marcar la opción:
+---
 
-Install Npcap in WinPcap API-compatible Mode  
+## Uso
 
-Esto es necesario para poder capturar paquetes de red.
+```bash
+python dofus_monitor.py
+```
 
-## Uso desde código fuente
+> ⚠ Ejecutar como **Administrador**.
 
-Si prefieres ejecutarlo manualmente:
+Si ya tenías personajes conectados al iniciar, **reconéctalos** para que la herramienta los detecte.
 
-### Requisitos
+---
 
-Python 3.10 o superior  
+## Gestión de Layouts (Wintabber Dofus)
 
-### Instalación
+Los layouts definen el orden de los personajes en los slots `Ctrl+Alt+1..0`.  
+Se comparte el archivo con **Wintabber Dofus** en `%APPDATA%\DofusMiniTabber\window_positions.json`.
 
-pip install scapy pywin32 psutil  
+Desde el **Gestor de Layouts** puedes:
+- Cargar y aplicar layouts guardados
+- Guardar el orden actual como nuevo layout
+- Importar archivos JSON de Wintabber
+- Eliminar layouts existentes
 
-### Ejecución
+También puedes reordenar los slots arrastrando las filas en la sección *Sesiones Activas*.
 
-python main.py  
+---
 
-## ¿Cómo funciona?
+## Logs
 
-La herramienta escucha paquetes de red relacionados con el juego y detecta cuándo ocurre un evento específico (como el inicio de turno).
-
-En base a esa información, identifica qué ventana corresponde al personaje activo y la pone en primer plano automáticamente.
-
-## Notas
-
-- Compatible con Dofus Retro (probado en servidores como Fallaster y Allisteria)  
-- No modifica archivos del juego  
-- No inyecta código ni automatiza acciones dentro del cliente  
+Los eventos se registran en `dofus_monitor.log` en el mismo directorio.
