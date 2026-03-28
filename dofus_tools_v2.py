@@ -5,7 +5,16 @@ from tkinter import font as tkfont, messagebox, simpledialog
 import json
 import os
 from pathlib import Path
-import socket 
+import socket
+
+# ── System Tray ───────────────────────────────────────────────────────────────
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+    print("[TRAY] pystray / Pillow no disponible. Instala con: pip install pystray Pillow")
 
 # ── win32 opcional (Windows) ──────────────────────────────────────────────────
 try:
@@ -31,7 +40,7 @@ SERVERS = {
 }
 REMOTE_IPS  = set(SERVERS.values())
 REMOTE_PORT = 443
-BPF_FILTER  = f"tcp and port {REMOTE_PORT}" # Modificado para capturar el primer paquete
+BPF_FILTER  = f"tcp and port {REMOTE_PORT}"
 WINDOW_KEYWORD = "Dofus Retro"
 
 # ─── Regex para detectar hosts dofus ───────────────────────────────────────────
@@ -50,6 +59,102 @@ stop_monitor            = threading.Event()
 feature_autofocus = True
 feature_autogroup = True
 feature_autotrade = True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  System Tray Helper
+# ══════════════════════════════════════════════════════════════════════════════
+def _crear_icono_tray() -> "Image.Image":
+    """
+    Genera un icono 64×64 para el system tray con la estética del programa
+    (círculo naranja con anillo interior, sobre fondo oscuro).
+    """
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Fondo circular oscuro
+    draw.ellipse([2, 2, size - 2, size - 2], fill=(15, 25, 35, 255))
+    # Anillo exterior (naranja/acento)
+    draw.ellipse([4, 4, size - 4, size - 4], outline=(245, 166, 35, 255), width=4)
+    # Punto interior verde
+    cx = size // 2
+    draw.ellipse([cx - 8, cx - 8, cx + 8, cx + 8], fill=(0, 230, 118, 255))
+
+    return img
+
+
+class SystemTrayManager:
+    """
+    Gestiona el icono en la bandeja del sistema.
+    Al minimizar la ventana principal se oculta y aparece el tray icon.
+    Doble clic o "Restaurar" en el menú vuelve a mostrar la ventana.
+    """
+
+    def __init__(self, app_ref: "DofusToolsApp"):
+        self.app   = app_ref
+        self._icon = None
+        self._thread = None
+
+    # ── Crear y arrancar el icono ─────────────────────────────────────────────
+    def start(self):
+        if not TRAY_AVAILABLE:
+            return
+        if self._icon is not None:
+            return  # ya corriendo
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Dofus Tools", self._on_restore, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Restaurar ventana", self._on_restore),
+            pystray.MenuItem("Salir",             self._on_quit),
+        )
+
+        self._icon = pystray.Icon(
+            name    = "DofusTools",
+            icon    = _crear_icono_tray(),
+            title   = "Dofus Tools · Monitor activo",
+            menu    = menu,
+        )
+
+        # pystray.Icon.run() es bloqueante → hilo aparte
+        self._thread = threading.Thread(target=self._icon.run, daemon=True)
+        self._thread.start()
+        log.info("[TRAY] Icono creado en bandeja del sistema")
+
+    # ── Ocultar la ventana principal ─────────────────────────────────────────
+    def hide_window(self):
+        """Oculta la ventana y asegura que el tray icon esté activo."""
+        self.start()           # no-op si ya corriendo
+        self.app.withdraw()
+        log.info("[TRAY] Ventana ocultada → tray activo")
+
+    # ── Restaurar la ventana ─────────────────────────────────────────────────
+    def restore_window(self, icon=None, item=None):
+        """Restaura la ventana desde el tray (puede llamarse desde hilo de pystray)."""
+        self.app.after(0, self._do_restore)
+
+    _on_restore = restore_window   # alias para el MenuItem
+
+    def _do_restore(self):
+        self.app.deiconify()
+        self.app.lift()
+        self.app.focus_force()
+        log.info("[TRAY] Ventana restaurada")
+
+    # ── Salir completamente ──────────────────────────────────────────────────
+    def _on_quit(self, icon=None, item=None):
+        log.info("[TRAY] Salir solicitado desde tray")
+        self.app.after(0, self.app._quit_app)
+
+    # ── Detener el icono ─────────────────────────────────────────────────────
+    def stop(self):
+        if self._icon:
+            try:
+                self._icon.stop()
+            except Exception:
+                pass
+            self._icon = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -88,11 +193,10 @@ class LayoutManager:
     cambio hecho aquí aparece en Wintabber y viceversa.
     """
 
-    # Nombre del directorio y posibles nombres de archivo que usa Wintabber
     _DIR  = "DofusMiniTabber"
     _FILES = [
-        "window_positions.json",   # nombre con extensión (más común)
-        "window_positions",        # sin extensión (algunas versiones)
+        "window_positions.json",
+        "window_positions",
     ]
 
     def __init__(self):
@@ -100,25 +204,13 @@ class LayoutManager:
         print(f"[LAYOUT] Archivo compartido con Wintabber: {self.config_path}")
         log.info(f"[LAYOUT] config_path={self.config_path}")
 
-    # ── Resolución de ruta ────────────────────────────────────────────────────
     def _resolve_config_path(self) -> str:
-        """
-        Detecta automáticamente el archivo de Wintabber en %APPDATA%.
-        Prioridad:
-          1. Archivo existente (con o sin .json)
-          2. Si ninguno existe, usa el nombre con .json (lo creará al guardar)
-        Funciona en cualquier PC porque usa %APPDATA% del sistema.
-        """
         appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
         base_dir = os.path.join(appdata, self._DIR)
-
-        # Buscar archivo existente
         for filename in self._FILES:
             candidate = os.path.join(base_dir, filename)
             if os.path.exists(candidate):
                 return candidate
-
-        # No existe aún → usar nombre estándar con .json (se creará al guardar)
         return os.path.join(base_dir, self._FILES[0])
 
     @property
@@ -129,9 +221,7 @@ class LayoutManager:
     def file_exists(self) -> bool:
         return os.path.exists(self.config_path)
 
-    # ── Lectura ───────────────────────────────────────────────────────────────
     def get_available_layouts(self):
-        """Leer layouts directamente desde el archivo de Wintabber"""
         try:
             if not self.file_exists:
                 print(f"[LAYOUT] Archivo no encontrado: {self.config_path}")
@@ -145,12 +235,7 @@ class LayoutManager:
             log.error(f"[LAYOUT] Error al leer layouts: {e}")
             return {}
 
-    # ── Escritura compartida ──────────────────────────────────────────────────
     def _save_all_layouts(self, layouts: dict) -> bool:
-        """
-        Escribir el dict completo de layouts en el archivo de Wintabber.
-        Al ser el mismo archivo, Wintabber verá los cambios automáticamente.
-        """
         try:
             os.makedirs(self.config_dir, exist_ok=True)
             with open(self.config_path, 'w', encoding='utf-8') as f:
@@ -163,13 +248,12 @@ class LayoutManager:
             return False
 
     def load_layout(self, layout_name):
-        """Cargar un layout específico y devolverlo como dict {window_name: position}"""
         try:
             layouts = self.get_available_layouts()
             if layout_name not in layouts:
                 print(f"[LAYOUT] Layout '{layout_name}' no encontrado")
                 return None
-            layout   = layouts[layout_name]
+            layout    = layouts[layout_name]
             positions = layout.get('Positions', [])
             layout_dict = {}
             for pos in positions:
@@ -182,7 +266,6 @@ class LayoutManager:
             return None
 
     def apply_layout_to_slots(self, layout_name):
-        """Aplicar layout al sistema de slots reordenando orden_personajes"""
         global orden_personajes
         layout = self.load_layout(layout_name)
         if not layout:
@@ -190,10 +273,7 @@ class LayoutManager:
 
         print(f"[LAYOUT] Aplicando layout '{layout_name}'")
         vivos = {v["name"]: v for v in all_detected.values()}
-
-        # Ordenar nombres de ventana del layout por su posición numérica
         sorted_windows = sorted(layout.items(), key=lambda x: x[1])
-
         nuevo_orden = []
         personajes_no_encontrados = []
 
@@ -209,7 +289,6 @@ class LayoutManager:
             else:
                 personajes_no_encontrados.append(window_name)
 
-        # Añadir personajes detectados que no están en el layout
         for personaje in vivos.keys():
             if personaje not in nuevo_orden:
                 nuevo_orden.append(personaje)
@@ -231,7 +310,6 @@ class LayoutManager:
             return False
 
     def save_current_layout(self, layout_name, description=""):
-        """Guardar el orden actual de personajes como layout en el archivo compartido"""
         global orden_personajes
         try:
             layouts = self.get_available_layouts()
@@ -255,7 +333,6 @@ class LayoutManager:
             return False
 
     def delete_layout(self, layout_name):
-        """Eliminar un layout del archivo compartido"""
         try:
             layouts = self.get_available_layouts()
             if layout_name not in layouts:
@@ -272,27 +349,14 @@ class LayoutManager:
             return False
 
     def import_layout_from_file(self, filepath):
-        """
-        Importar un archivo JSON de Wintabber Dofus.
-        Devuelve (layout_name, layout_data, es_generico) o (None, None, False) si falla.
-        'es_generico' = True cuando todos los WindowName son iguales (ej: 'Dofus Retro v1.47.22')
-        """
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
-            # Aceptar tanto el formato con clave raíz como sin ella
-            # Formato Wintabber: {"NombreLayout": {"Name":..., "Positions":[...]}}
-            # Podría también venir como lista o directamente el objeto
             if isinstance(data, dict):
-                # Puede ser un dict de layouts (formato Wintabber normal)
-                # o puede ser un único layout directamente
                 if "Positions" in data:
-                    # Es un único layout directo
                     name = data.get("Name", Path(filepath).stem)
                     layouts_raw = {name: data}
                 else:
-                    # Es un dict de layouts (formato estándar)
                     layouts_raw = data
             else:
                 print(f"[LAYOUT] Formato de archivo no reconocido: {filepath}")
@@ -300,11 +364,10 @@ class LayoutManager:
 
             resultados = {}
             for layout_name, layout_data in layouts_raw.items():
-                positions = layout_data.get("Positions", [])
-                # Detectar si todos los WindowName son genéricos (iguales o contienen "Dofus Retro")
+                positions    = layout_data.get("Positions", [])
                 window_names = [p.get("WindowName", "") for p in positions]
                 unique_names = set(window_names)
-                es_generico = (
+                es_generico  = (
                     len(unique_names) <= 1 or
                     all("Dofus Retro" in n for n in window_names)
                 )
@@ -322,7 +385,6 @@ class LayoutManager:
             return None
 
     def merge_imported_layouts(self, layouts_importados):
-        """Fusionar layouts importados con los existentes y guardar en disco"""
         try:
             existentes = self.get_available_layouts()
             existentes.update(layouts_importados)
@@ -337,7 +399,6 @@ class LayoutManager:
             return False
 
     def show_layout_menu(self):
-        """Mostrar menú interactivo de layouts (versión consola)"""
         layouts = self.get_available_layouts()
         if not layouts:
             print("[LAYOUT] No hay layouts guardados en Wintabber Dofus")
@@ -432,10 +493,6 @@ class ToggleSwitch(tk.Canvas):
 #  Fila arrastrable de personaje
 # ══════════════════════════════════════════════════════════════════════════════
 class DraggableCharRow(tk.Frame):
-    """
-    Tarjeta de personaje arrastrable.
-    Al hacer drag-and-drop dentro del contenedor reordena la lista.
-    """
     CARD   = "#1b2d3e"
     BORDER = "#223344"
 
@@ -488,9 +545,6 @@ class DraggableCharRow(tk.Frame):
 #  Interfaz Gráfica de Layouts  (Toplevel completo)
 # ══════════════════════════════════════════════════════════════════════════════
 class LayoutManagerGUI(tk.Toplevel):
-    """Ventana de gestión de layouts con interfaz gráfica completa"""
-
-    # Paleta heredada de DofusToolsApp
     BG       = "#0f1923"
     PANEL    = "#162230"
     CARD     = "#1b2d3e"
@@ -513,13 +567,11 @@ class LayoutManagerGUI(tk.Toplevel):
         self.configure(bg=self.BG)
         self.transient(parent)
         self.grab_set()
-        self._selected_name = None   # layout seleccionado actualmente
+        self._selected_name = None
         self._setup_ui()
         self._refresh_layouts()
 
-    # ── Construcción de la UI ─────────────────────────────────────────────────
     def _setup_ui(self):
-        # ── Header ──────────────────────────────────────────────────────────
         header = tk.Frame(self, bg=self.PANEL, height=56)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -534,11 +586,9 @@ class LayoutManagerGUI(tk.Toplevel):
                  font=tkfont.Font(family="Segoe UI", size=9)).pack(side="right")
         tk.Frame(self, bg=self.BORDER, height=1).pack(fill="x")
 
-        # ── Cuerpo principal ─────────────────────────────────────────────────
         body = tk.Frame(self, bg=self.BG)
         body.pack(fill="both", expand=True, padx=16, pady=12)
 
-        # Panel izquierdo: lista de layouts
         left = tk.Frame(body, bg=self.BG)
         left.pack(side="left", fill="both", expand=True)
 
@@ -568,7 +618,6 @@ class LayoutManagerGUI(tk.Toplevel):
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
         self.listbox.bind("<Double-Button-1>", lambda e: self._apply_layout())
 
-        # Panel derecho: detalles + botones
         right = tk.Frame(body, bg=self.BG, width=200)
         right.pack(side="right", fill="y", padx=(14, 0))
         right.pack_propagate(False)
@@ -601,7 +650,6 @@ class LayoutManagerGUI(tk.Toplevel):
                                    font=tkfont.Font(family="Segoe UI", size=7))
         self.lbl_date.pack(anchor="w", pady=(2, 0))
 
-        # Separador
         tk.Frame(right, bg=self.BORDER, height=1).pack(fill="x", pady=10)
 
         btn_cfg = dict(relief="flat", cursor="hand2",
@@ -639,7 +687,6 @@ class LayoutManagerGUI(tk.Toplevel):
                   command=self._import_json,
                   **btn_cfg).pack(fill="x")
 
-        # ── Barra de estado ──────────────────────────────────────────────────
         tk.Frame(self, bg=self.BORDER, height=1).pack(fill="x")
         status_bar = tk.Frame(self, bg=self.PANEL, height=28)
         status_bar.pack(fill="x")
@@ -649,9 +696,7 @@ class LayoutManagerGUI(tk.Toplevel):
                                     font=tkfont.Font(family="Segoe UI", size=8))
         self.lbl_status.pack(side="left", padx=12)
 
-    # ── Lógica interna ────────────────────────────────────────────────────────
     def _refresh_layouts(self):
-        """Recargar la lista de layouts desde disco"""
         self._layouts = self.lm.get_available_layouts()
         self.listbox.delete(0, "end")
         for name in self._layouts:
@@ -751,7 +796,6 @@ class LayoutManagerGUI(tk.Toplevel):
             messagebox.showerror("Error", "No se pudo guardar el layout.", parent=self)
 
     def _import_json(self):
-        """Abrir diálogo de archivo y procesar el JSON importado"""
         from tkinter import filedialog
         filepath = filedialog.askopenfilename(
             parent=self,
@@ -769,20 +813,15 @@ class LayoutManagerGUI(tk.Toplevel):
                                  parent=self)
             return
 
-        # Procesar cada layout importado
         layouts_a_guardar = {}
         for layout_name, (layout_data, es_generico) in resultados.items():
             positions = layout_data.get("Positions", [])
-
             if es_generico and positions:
-                # Los WindowName son genéricos → asignar personajes manualmente
                 resultado_asignado = self._assign_generic_layout(
                     layout_name, len(positions)
                 )
                 if resultado_asignado is None:
-                    # Usuario canceló este layout
                     continue
-                # Reconstruir positions con los nombres asignados
                 new_positions = [
                     {"WindowName": nombre, "Position": i}
                     for i, nombre in enumerate(resultado_asignado)
@@ -791,7 +830,6 @@ class LayoutManagerGUI(tk.Toplevel):
                 layout_data["Positions"] = new_positions
                 layouts_a_guardar[layout_name] = layout_data
             else:
-                # WindowNames ya tienen nombres de personajes
                 layouts_a_guardar[layout_name] = layout_data
 
         if not layouts_a_guardar:
@@ -814,15 +852,8 @@ class LayoutManagerGUI(tk.Toplevel):
             messagebox.showerror("Error", "No se pudieron guardar los layouts.", parent=self)
 
     def _assign_generic_layout(self, layout_name: str, num_slots: int):
-        """
-        Diálogo para asignar manualmente personajes a cada slot
-        cuando el JSON tiene WindowNames genéricos.
-        Devuelve lista de nombres en orden, o None si el usuario cancela.
-        """
-        # Obtener personajes detectados actualmente
         personajes_activos = [v["name"] for v in all_detected.values()]
 
-        # Crear ventana de asignación
         win = tk.Toplevel(self)
         win.title(f"Asignar personajes — {layout_name}")
         win.geometry("480x120")
@@ -831,13 +862,11 @@ class LayoutManagerGUI(tk.Toplevel):
         win.transient(self)
         win.grab_set()
 
-        # Ajustar altura según número de slots
         altura = 80 + num_slots * 38 + 60
         win.geometry(f"480x{min(altura, 600)}")
 
-        resultado = [None]  # mutable para capturar en callback
+        resultado = [None]
 
-        # ── Header ──────────────────────────────────────────────────────────
         tk.Label(win, bg=self.PANEL,
                  text=f"  📋  El layout '{layout_name}' tiene {num_slots} slots genéricos.",
                  fg=self.TEXT, font=tkfont.Font(family="Segoe UI", size=9),
@@ -849,8 +878,7 @@ class LayoutManagerGUI(tk.Toplevel):
                  anchor="w").pack(fill="x")
         tk.Frame(win, bg=self.BORDER, height=1).pack(fill="x", pady=(0, 8))
 
-        # ── Scroll para muchos slots ─────────────────────────────────────────
-        canvas_w = tk.Canvas(win, bg=self.BG, highlightthickness=0, bd=0)
+        canvas_w    = tk.Canvas(win, bg=self.BG, highlightthickness=0, bd=0)
         scrollbar_w = tk.Scrollbar(win, orient="vertical", command=canvas_w.yview)
         canvas_w.configure(yscrollcommand=scrollbar_w.set)
         scrollbar_w.pack(side="right", fill="y")
@@ -861,9 +889,8 @@ class LayoutManagerGUI(tk.Toplevel):
         slots_frame.bind("<Configure>",
                          lambda e: canvas_w.configure(scrollregion=canvas_w.bbox("all")))
 
-        # ── Filas de asignación ──────────────────────────────────────────────
-        combos = []
-        opciones = [""] + personajes_activos  # vacío = omitir slot
+        combos  = []
+        opciones = [""] + personajes_activos
 
         for i in range(num_slots):
             row = tk.Frame(slots_frame, bg=self.BG)
@@ -874,7 +901,6 @@ class LayoutManagerGUI(tk.Toplevel):
                      width=8, anchor="w").pack(side="left")
 
             var = tk.StringVar(win)
-            # Preseleccionar personaje si hay suficientes activos
             if i < len(personajes_activos):
                 var.set(personajes_activos[i])
             else:
@@ -890,14 +916,12 @@ class LayoutManagerGUI(tk.Toplevel):
             combo.pack(side="left", padx=(8, 0))
             combos.append(var)
 
-        # ── Botones ──────────────────────────────────────────────────────────
         tk.Frame(win, bg=self.BORDER, height=1).pack(fill="x", pady=(8, 0))
         btn_row = tk.Frame(win, bg=self.PANEL)
         btn_row.pack(fill="x")
 
         def _confirmar():
             asignados = [v.get().strip() for v in combos]
-            # Filtrar vacíos del final pero respetar el orden
             while asignados and asignados[-1] == "":
                 asignados.pop()
             resultado[0] = asignados if asignados else None
@@ -928,7 +952,6 @@ class LayoutManagerGUI(tk.Toplevel):
 #  Funciones públicas para abrir la GUI de layouts
 # ══════════════════════════════════════════════════════════════════════════════
 def abrir_gestor_layouts():
-    """Abrir el gestor de layouts con interfaz gráfica completa"""
     if app:
         LayoutManagerGUI(app, layout_manager)
     else:
@@ -936,7 +959,6 @@ def abrir_gestor_layouts():
 
 
 def cargar_layout_wintabber():
-    """Abrir gestor gráfico o fallback a consola"""
     if app:
         LayoutManagerGUI(app, layout_manager)
     else:
@@ -971,8 +993,41 @@ class DofusToolsApp(tk.Tk):
         self.configure(bg=self.BG)
         self._setup_fonts()
         self._build_ui()
+
+        # ── System Tray ──────────────────────────────────────────────────────
+        self.tray = SystemTrayManager(self)
+        if TRAY_AVAILABLE:
+            # Arrancar el icono en background desde el inicio
+            self.tray.start()
+            # Interceptar el botón minimizar de la barra de título
+            self.bind("<Unmap>", self._on_unmap)
+        else:
+            log.warning("[TRAY] pystray/Pillow no disponibles; minimizar funcionará normalmente.")
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ── Manejo de minimizar → ir al tray ─────────────────────────────────────
+    def _on_unmap(self, event):
+        """
+        Se dispara cuando la ventana se iconifica (minimiza).
+        Solo actúa si el widget es la ventana raíz (no un hijo oculto).
+        """
+        if event.widget is self:
+            # Pequeño delay para que Tk termine la animación de minimizar
+            self.after(100, self.tray.hide_window)
+
+    # ── Salida limpia ─────────────────────────────────────────────────────────
+    def _quit_app(self):
+        """Cierra todo: tray, monitor de red y la ventana."""
+        stop_monitor.set()
+        self.tray.stop()
+        self.destroy()
+
+    def _on_close(self):
+        """Clic en la X → igual que salir desde el tray."""
+        self._quit_app()
+
+    # ── Resto de métodos sin cambios ──────────────────────────────────────────
     def _setup_fonts(self):
         self.font_title   = tkfont.Font(family="Segoe UI", size=14, weight="bold")
         self.font_section = tkfont.Font(family="Segoe UI", size=7,  weight="bold")
@@ -1032,7 +1087,6 @@ class DofusToolsApp(tk.Tk):
         return card, badge, toggle
 
     def _build_ui(self):
-        # Header
         header = tk.Frame(self, bg=self.PANEL, height=64)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -1059,7 +1113,6 @@ class DofusToolsApp(tk.Tk):
 
         tk.Frame(self, bg=self.BORDER, height=1).pack(fill="x")
 
-        # Scroll
         canvas = tk.Canvas(self, bg=self.BG, highlightthickness=0,
                             bd=0, yscrollincrement=1)
         sb = tk.Scrollbar(self, orient="vertical", command=canvas.yview)
@@ -1084,7 +1137,6 @@ class DofusToolsApp(tk.Tk):
     def _build_content(self, parent):
         global feature_autofocus, feature_autogroup, feature_autotrade
 
-        # ESTADO GENERAL
         self._section_label(parent, "ESTADO GENERAL")
         estado_card = tk.Frame(parent, bg=self.CARD, highlightthickness=1,
                                highlightbackground=self.BORDER)
@@ -1104,7 +1156,6 @@ class DofusToolsApp(tk.Tk):
             lbl.pack(side="right")
             self._estado_labels[key] = lbl
 
-        # COMBAT
         self._section_label(parent, "COMBAT")
 
         def _on_autofocus(state):
@@ -1127,7 +1178,6 @@ class DofusToolsApp(tk.Tk):
             "Responde a invitaciones de grupo automáticamente",
             initial_on=True, on_toggle=_on_autogroup)
 
-        # INTERCAMBIO
         self._section_label(parent, "INTERCAMBIO")
 
         def _on_autotrade(state):
@@ -1140,7 +1190,6 @@ class DofusToolsApp(tk.Tk):
             "Cambia de pantalla al recibir una solicitud de intercambio",
             initial_on=True, on_toggle=_on_autotrade)
 
-        # LAYOUTS DE WINTABBER DOFUS
         self._section_label(parent, "LAYOUTS WINTABBER DOFUS")
 
         layout_card = tk.Frame(parent, bg=self.CARD, highlightthickness=1,
@@ -1169,7 +1218,6 @@ class DofusToolsApp(tk.Tk):
         cargar_btn.bind("<Enter>", lambda e: cargar_btn.config(bg="#0097a7"))
         cargar_btn.bind("<Leave>", lambda e: cargar_btn.config(bg=self.TEAL))
 
-        # SESIONES ACTIVAS
         self._section_label(parent, "SESIONES ACTIVAS  ·  ARRASTRA PARA REORDENAR SLOTS")
         sess_card = tk.Frame(parent, bg=self.CARD, highlightthickness=1,
                              highlightbackground=self.BORDER)
@@ -1186,7 +1234,6 @@ class DofusToolsApp(tk.Tk):
         self.chars_frame.pack(fill="x", padx=4, pady=4)
         self.char_widgets = {}
 
-        # DISCLAIMER
         disc = tk.Frame(parent, bg="#1a2a1a", highlightthickness=1,
                         highlightbackground="#2a4a2a")
         disc.pack(fill="x", padx=18, pady=(4, 18))
@@ -1202,7 +1249,6 @@ class DofusToolsApp(tk.Tk):
             justify="left"
         ).pack(side="left")
 
-    # ── Estado general ────────────────────────────────────────────────────────
     def _update_estado(self, key: str, active: bool):
         lbl = self._estado_labels.get(key)
         if lbl:
@@ -1212,7 +1258,6 @@ class DofusToolsApp(tk.Tk):
                 fg=self.GREEN     if active else self.RED
             )
 
-    # ── Tabla de personajes (con slots arrastrables) ──────────────────────────
     def update_characters(self):
         global orden_personajes
 
@@ -1223,13 +1268,11 @@ class DofusToolsApp(tk.Tk):
             if n not in orden_personajes:
                 orden_personajes.append(n)
 
-        # Eliminar widgets de personajes que ya no están
         for name in list(self.char_widgets.keys()):
             if name not in vivos:
                 self.char_widgets[name].destroy()
                 del self.char_widgets[name]
 
-        # Crear widgets solo si no existen
         for name, info in vivos.items():
             if name not in self.char_widgets:
                 row = DraggableCharRow(
@@ -1238,18 +1281,16 @@ class DofusToolsApp(tk.Tk):
                 )
                 self.char_widgets[name] = row
 
-        # Reordenar sin destruir
         for idx, name in enumerate(orden_personajes):
             row = self.char_widgets[name]
             row.pack_forget()
             row.pack(fill="x", pady=2)
-            # Actualizar etiqueta de slot
             row.lbl_slot.config(text=f"SLOT {idx + 1}")
 
     def reordenar_personajes(self, name: str, y_in_container: int):
         global orden_personajes
 
-        widgets = list(self.chars_frame.winfo_children())
+        widgets  = list(self.chars_frame.winfo_children())
         nuevo_idx = len(widgets)
         for i, w in enumerate(widgets):
             if y_in_container < w.winfo_y() + w.winfo_height() // 2:
@@ -1263,10 +1304,6 @@ class DofusToolsApp(tk.Tk):
 
         self.update_characters()
         self.update_idletasks()
-
-    def _on_close(self):
-        stop_monitor.set()
-        self.destroy()
 
 
 # ─── Instancia global ─────────────────────────────────────────────────────────
@@ -1368,7 +1405,6 @@ def process_message(packet) -> None:
 
     data = packet[Raw].load
 
-    # --- 0. DETECCIÓN DINÁMICA DE NUEVOS SERVIDORES ---
     match = HOST_REGEX.search(data)
     if match:
         host = match.group().decode()
@@ -1376,32 +1412,27 @@ def process_message(packet) -> None:
             ip = socket.gethostbyname(host)
             if ip not in REMOTE_IPS:
                 REMOTE_IPS.add(ip)
-                # Extraer nombre amigable (ej. "fallaster2") y añadirlo a SERVERS
                 nombre_server = host.split('-')[1].split('.')[0].capitalize() if '-' in host else host
                 SERVERS[nombre_server] = ip
                 log.info(f"🆕 Nuevo servidor detectado: {host} -> {ip}")
                 print(f"🆕 Nuevo servidor detectado: {host} -> {ip}")
         except Exception as e:
             log.error(f"Error resolviendo {host}: {e}")
-    # ---------------------------------------------------
 
-    ip_layer   = packet[IP]
-    tcp_layer  = packet[TCP]
-    src_ip     = ip_layer.src
+    ip_layer  = packet[IP]
+    tcp_layer = packet[TCP]
+    src_ip    = ip_layer.src
 
-    # EARLY RETURN: Si el tráfico no es de/hacia Dofus, lo descartamos inmediatamente
     if src_ip not in REMOTE_IPS and ip_layer.dst not in REMOTE_IPS:
         return
 
     local_port = tcp_layer.dport if src_ip in REMOTE_IPS else tcp_layer.sport
     server     = get_server_name(src_ip if src_ip in REMOTE_IPS else ip_layer.dst)
 
-    # 1. Registro
     for cid, name in re.findall(rb"ASK\|(\d+)\|([^|]+)\|", data):
         _registrar_personaje(cid.decode(), local_port,
                              name.decode(errors="ignore"), server)
 
-    # 2. Turnos — Auto-focus
     if feature_autofocus:
         for char_id in re.findall(rb"GTS(\d+)\|", data):
             cid_str = char_id.decode()
@@ -1417,7 +1448,6 @@ def process_message(packet) -> None:
                     print(f"[DEBUG] '{nombre}' NO en orden_personajes → fallback")
                     activar_ventana_por_puerto(local_port)
 
-    # 3. Intercambios — Auto-trade
     if feature_autotrade:
         matches_erk = re.findall(rb"ERK(\d+)\|(\d+)\|", data)
         if matches_erk:
@@ -1442,7 +1472,6 @@ def process_message(packet) -> None:
             else:
                 print(f"[DEBUG-TRADE] receptor '{rec_nombre}' NO en id_to_port")
 
-    # 4. Grupo — Auto-group
     if feature_autogroup:
         for emi_raw, rec_raw in re.findall(rb"PIK([^|]+)\|([^|\x00]+)", data):
             emi_n = emi_raw.decode(errors="ignore")
@@ -1470,10 +1499,8 @@ def start_monitor():
         log.error(traceback.format_exc())
 
 def monitor_desconexiones():
-    """Hilo liviano que detecta personajes desconectados cada 5 segundos."""
     while not stop_monitor.is_set():
         try:
-            # Puertos TCP activos en este momento
             puertos_activos = set()
             for conn in psutil.net_connections(kind="tcp"):
                 if conn.status in ("ESTABLISHED", "SYN_SENT") and conn.laddr:
@@ -1499,7 +1526,7 @@ def monitor_desconexiones():
         except Exception as e:
             log.error(f"[monitor_desconexiones] {e}")
 
-        stop_monitor.wait(5)  # espera 5 s o hasta que se detenga
+        stop_monitor.wait(5)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
